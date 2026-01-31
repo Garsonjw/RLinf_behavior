@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import time
 from typing import Any
 
 import torch
@@ -174,6 +175,7 @@ class MultiStepRolloutWorker(Worker):
         param_state_dict = await self.recv(
             self.actor_group_name, src_rank=self.actor_weight_src_rank, async_op=True
         ).async_wait()
+        param_state_dict = {k: v.to(self.device) for k, v in param_state_dict.items()}
 
         self.hf_model.load_state_dict(param_state_dict)
         del param_state_dict
@@ -217,7 +219,7 @@ class MultiStepRolloutWorker(Worker):
             // self.cfg.actor.model.num_action_chunks
         )
 
-        for _ in tqdm(
+        for _epoch_idx in tqdm(
             range(self.cfg.algorithm.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
@@ -226,6 +228,7 @@ class MultiStepRolloutWorker(Worker):
             last_forward_inputs = [
                 None for i in range(self.num_pipeline_stages)
             ]  # save actions
+            _epoch_predict_total_time = 0.0
 
             for _ in range(n_chunk_steps):
                 for stage_id in range(self.num_pipeline_stages):
@@ -240,7 +243,10 @@ class MultiStepRolloutWorker(Worker):
                     dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
                         env_output, extracted_obs
                     )
+                    _predict_start = time.time()
                     actions, result = self.predict(extracted_obs)
+                    torch.cuda.synchronize()
+                    _epoch_predict_total_time += (time.time() - _predict_start) * 1000
                     chunk_step_result = ChunkStepResult(
                         prev_logprobs=result["prev_logprobs"],
                         prev_values=result["prev_values"],
@@ -295,6 +301,9 @@ class MultiStepRolloutWorker(Worker):
                     self.buffer_list[stage_id].add_transition(
                         last_extracted_obs[stage_id], real_extracted_obs
                     )
+
+            if self._rank == 0:
+                print(f"[ROLLOUT TIMING] Epoch {_epoch_idx}: predict total = {_epoch_predict_total_time/1000:.2f} s", flush=True)
 
         for i in range(self.num_pipeline_stages):
             self.send_rollout_batch(actor_channel, i)

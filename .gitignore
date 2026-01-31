@@ -17,3 +17,11 @@ outputs/*
 .venv
 uv.lock
 rlinf/envs/maniskill/assets
+
+# Temporary/debug files
+debug_policy_input_images/
+obs/
+obs.zip
+tmp*/
+.cursor/
+download_model.sh

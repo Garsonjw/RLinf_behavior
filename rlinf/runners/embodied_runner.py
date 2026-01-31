@@ -85,9 +85,15 @@ class EmbodiedRunner:
 
     def init_workers(self):
         # create worker in order to decrease the maximum memory usage
-        self.actor.init_worker().wait()
-        self.rollout.init_worker().wait()
-        self.env.init_worker().wait()
+        # self.actor.init_worker().wait()
+        # self.rollout.init_worker().wait()
+        # self.env.init_worker().wait()
+        actor_handle = self.actor.init_worker()
+        rollout_handle = self.rollout.init_worker()
+        env_handle = self.env.init_worker()
+        actor_handle.wait()
+        rollout_handle.wait()
+        env_handle.wait()
 
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:

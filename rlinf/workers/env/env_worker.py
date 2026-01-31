@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -145,9 +146,11 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
+        _env_step_start = time.time()
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
+        self._last_env_step_time = (time.time() - _env_step_start) * 1000
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         if not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
@@ -350,12 +353,14 @@ class EnvWorker(Worker):
                 env_output: EnvOutput = env_output_list[stage_id]
                 self.send_env_batch(output_channel, env_output.to_dict())
 
+            _epoch_env_total_time = 0.0
             for _ in range(n_chunk_steps):
                 for stage_id in range(self.stage_num):
                     raw_chunk_actions = self.recv_chunk_actions(input_channel)
                     env_output, env_info = self.env_interact_step(
                         raw_chunk_actions, stage_id
                     )
+                    _epoch_env_total_time += self._last_env_step_time
                     self.send_env_batch(output_channel, env_output.to_dict())
                     env_output_list[stage_id] = env_output
                     for key, value in env_info.items():
@@ -369,6 +374,9 @@ class EnvWorker(Worker):
                                 env_metrics[key].append(value)
                         else:
                             env_metrics[key].append(value)
+
+            if self._rank == 0:
+                print(f"[ENV TIMING] Epoch {epoch}: env_step total = {_epoch_env_total_time/1000:.2f} s", flush=True)
 
             self.last_obs_list = [env_output.obs for env_output in env_output_list]
             self.last_dones_list = [env_output.dones for env_output in env_output_list]

@@ -16,16 +16,22 @@
 import dataclasses
 import difflib
 from typing import Optional
-
+from enum import Enum
+from enum import auto
+import openpi.transforms as _transforms
 import openpi.models.pi0_config as pi0_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
+from collections.abc import Sequence
 from openpi.training.config import (
     AssetsConfig,
     DataConfig,
     TrainConfig,
 )
 
+from rlinf.models.embodiment.openpi.dataconfig.behavior_dataconfig import (
+     LeRobotBehaviorDataConfig
+)
 from rlinf.models.embodiment.openpi.dataconfig.calvin_dataconfig import (
     LeRobotCalvinDataConfig,
 )
@@ -47,6 +53,82 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+
+class DroidActionSpace(Enum):
+    """Action space for DROID dataset."""
+
+    JOINT_POSITION = auto()
+    JOINT_VELOCITY = auto()
+
+@dataclasses.dataclass(frozen=True)
+class BehaviorDataConfig:
+    # LeRobot repo id. If None, fake data will be created.
+    repo_id: str | None = None
+
+    # Directory within the assets directory containing the data assets.
+    asset_id: str | None = None
+
+    # Contains precomputed normalization stats. If None, normalization will not be performed.
+    norm_stats: dict[str, _transforms.NormStats] | None = None
+
+    # Used to adopt the inputs from a dataset specific format to a common format
+    # which is expected by the data transforms.
+    repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
+
+    # Data transforms, typically include robot specific transformations. Will be applied
+    # before the data is normalized. See `model.Observation` and `model.Actions` to learn about the
+    # normalized data.
+    data_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
+
+    # Model specific transforms. Will be applied after the data is normalized.
+    model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
+
+    # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
+    use_quantile_norm: bool = False
+
+    # Names of keys that will be used by the data loader to generate the action sequence. The length of the
+    # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
+    # LeRobot dataset is using different keys to represent the action.
+    action_sequence_keys: Sequence[str] = ("actions",)
+
+    # If true, will use the LeRobot dataset task to define the prompt.
+    prompt_from_task: bool = False
+
+    # Only used for RLDS data loader (ie currently only used for DROID).
+    rlds_data_dir: str | None = None
+
+    # Only used for B1K data loader.
+    behavior_dataset_root: str = None
+
+    # Action space for DROID dataset.
+    action_space: DroidActionSpace | None = None
+
+    # Path to the data filter file for DROID dataset
+    filter_dict_path: str | None = None
+
+    # episodes index to use for training
+    episodes_index: list[int] | None = None
+
+    # tasks to use for training
+    tasks: list[str] | None = None
+
+    # tasks to use for training
+    modalities: list[str] = dataclasses.field(default_factory=lambda: ["rgb"])
+
+    # tolerance decoding
+    tolerance_s: float = 1e-4
+
+    # fine-grained level of orchestrators to use for training
+    fine_grained_level: int = (0,)  # 0, 1, 2
+
+    # whether to return seg instance
+    return_seg_instance: bool = False
+
+    # type of rgb to use for training
+    train_rgb_type: str = "regular"  # regular | box | point
+
+    # skill list to use for training
+    skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
 
 _CONFIGS = [
     TrainConfig(
@@ -223,6 +305,36 @@ _CONFIGS = [
         ),
         pytorch_weight_path="checkpoints/torch/pi0_base",
     ),
+    # TrainConfig(
+    #     name="pi0_behavior",
+    #     model=pi0_config.Pi0Config(),
+    #     data=LeRobotBehaviorDataConfig(
+    #         repo_id="physical-intelligence/behavior",
+    #         base_config=DataConfig(prompt_from_task=True),
+    #         assets=AssetsConfig(assets_dir="checkpoints/torch/pi0_behavior/assets"),
+    #         extra_delta_transform=True,
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader(
+    #         "checkpoints/jax/pi0_base/params"
+    #                 ),
+    #     pytorch_weight_path="checkpoints/torch/pi0_base",
+    #     num_train_steps=30_000,
+    # ),
+
+    TrainConfig(
+        name="pi05_behavior",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotBehaviorDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=BehaviorDataConfig(prompt_from_task=True),
+            assets=AssetsConfig(assets_dir="checkpoints/torch/pi50_behavior/assets"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("path_to_your_pretrained_checkpoint"),
+        num_train_steps=20_000,
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+    ),
+    
     TrainConfig(
         name="pi0_custom",
         model=pi0_config.Pi0Config(),

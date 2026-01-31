@@ -20,6 +20,7 @@ from omegaconf import DictConfig
 
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
+    import sys, os
 
     import openpi.shared.download as download
     import openpi.transforms as transforms
@@ -56,6 +57,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
     for weight_path in weight_paths:
         safetensors.torch.load_model(model, weight_path, strict=False)
+    
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()

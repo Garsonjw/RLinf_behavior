@@ -14,10 +14,10 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 USE_MIRRORS=0
 GITHUB_PREFIX=""
-
+NO_ROOT=0
 SUPPORTED_TARGETS=("embodied" "reason" "docs")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim")
 
 # Ensure uv is installed
 if ! command -v uv &> /dev/null; then
@@ -49,6 +49,7 @@ Common options:
     -h, --help             Show this help message and exit.
     --venv <dir>           Virtual environment directory name (default: .venv).
     --use-mirror           Use mirrors for faster downloads.
+    --no-root              Avoid system dependency installation for non-root users. Only use this if you are certain system dependencies are already installed.
 EOF
 }
 
@@ -90,6 +91,10 @@ parse_args() {
                 ;;
             --use-mirror)
                 USE_MIRRORS=1
+                shift
+                ;;
+            --no-root)
+                NO_ROOT=1
                 shift
                 ;;
             --*)
@@ -252,7 +257,9 @@ clone_or_reuse_repo() {
 
 install_common_embodied_deps() {
     uv sync --extra embodied --active
-    bash $SCRIPT_DIR/embodied/sys_deps.sh
+    if [ "$NO_ROOT" -eq 0 ]; then
+        bash $SCRIPT_DIR/embodied/sys_deps.sh
+    fi
     {
         echo "export NVIDIA_DRIVER_CAPABILITIES=all"
         echo "export VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json"
@@ -266,6 +273,11 @@ install_openvla_model() {
             create_and_sync_venv
             install_common_embodied_deps
             install_maniskill_libero_env
+            ;;
+        frankasim)
+            create_and_sync_venv
+            install_common_embodied_deps
+            install_frankasim_env
             ;;
         *)
             echo "Environment '$ENV_NAME' is not supported for OpenVLA model." >&2
@@ -303,6 +315,14 @@ install_openvla_oft_model() {
 
 install_openpi_model() {
     case "$ENV_NAME" in
+        behavior)
+            PYTHON_VERSION="3.10"
+            create_and_sync_venv
+            install_common_embodied_deps
+            uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/openpi
+            install_behavior_env
+            uv pip install protobuf==6.33.0
+            ;;
         maniskill_libero)
             create_and_sync_venv
             install_common_embodied_deps
@@ -385,7 +405,9 @@ install_env_only() {
         franka)
             uv sync --extra franka --active
             if [ "$SKIP_ROS" -ne 1 ]; then
-                bash $SCRIPT_DIR/embodied/ros_install.sh
+                if [ "$NO_ROOT" -eq 0 ]; then
+                    bash $SCRIPT_DIR/embodied/ros_install.sh
+                fi
                 install_franka_env
             fi
             ;;
@@ -513,6 +535,13 @@ install_franka_env() {
     echo "export CMAKE_PREFIX_PATH=$ROS_CATKIN_PATH/libfranka/build:\$CMAKE_PREFIX_PATH" >> "$VENV_DIR/bin/activate"
     echo "source /opt/ros/noetic/setup.bash" >> "$VENV_DIR/bin/activate"
     echo "source $ROS_CATKIN_PATH/devel/setup.bash" >> "$VENV_DIR/bin/activate"
+}
+
+install_frankasim_env() {
+    local serldir
+    serldir=$(clone_or_reuse_repo SERL_PATH "$VENV_DIR/serl" https://github.com/RLinf/serl.git -b RLinf/franka-sim)
+    uv pip install -e "$serldir/franka_sim"
+    uv pip install -r "$serldir/franka_sim/requirements.txt"
 }
 
 #=======================REASONING INSTALLER=======================

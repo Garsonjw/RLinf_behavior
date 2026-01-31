@@ -793,21 +793,70 @@ def validate_embodied_cfg(cfg):
         elif (
             cfg.env.train.env_type == "behavior" or cfg.env.eval.env_type == "behavior"
         ):
-            import omnigibson as og
+            import copy
+            import numpy as np
+            import torch
+            from omegaconf import OmegaConf
 
-            assert cfg.env.train.base_config_name == "r1pro_behavior", (
-                f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
+            def _omegaconf_sanitize(obj):
+                # OmegaConf 不支持 torch.Tensor / numpy 类型，递归转换成 primitive
+                if isinstance(obj, torch.Tensor):
+                    return obj.detach().cpu().tolist()
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                if isinstance(obj, (np.floating, np.integer)):
+                    return obj.item()
+                if isinstance(obj, dict):
+                    return {k: _omegaconf_sanitize(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_omegaconf_sanitize(v) for v in obj]
+                return obj
+
+            import omnigibson as og
+            from gello.robots.sim_robot.og_teleop_utils import (
+                load_available_tasks,
+                generate_robot_config,
             )
-            # Load the pre-selected configuration and set the online_sampling flag
-            config_filename = os.path.join(
-                og.example_config_path, "r1pro_behavior.yaml"
+            from omnigibson.learning.utils.eval_utils import (
+                generate_basic_environment_config,
+                TASK_INDICES_TO_NAMES,
+                PROPRIOCEPTION_INDICES,
             )
-            omnigibson_cfg = yaml.load(
-                open(config_filename, "r"), Loader=yaml.FullLoader
+            
+            task_idx = cfg.env.train.task_idx
+            task_name = TASK_INDICES_TO_NAMES[task_idx]
+            print(f"[validate_embodied_cfg] task_idx={task_idx}, task_name={task_name}", flush=True)
+
+            # 加载可用任务配置
+            available_tasks = load_available_tasks()
+            assert task_name in available_tasks, f"Got invalid task name: {task_name}"
+            task_cfg = available_tasks[task_name][0]  # 获取第一个任务实例配置
+
+            # 动态生成环境配置（与 eval.py 一致）
+            omnigibson_cfg = generate_basic_environment_config(
+                task_name=task_name,
+                task_cfg=task_cfg
             )
+
+            # 生成机器人配置
+            omnigibson_cfg["robots"] = [
+                generate_robot_config(
+                    task_name=task_name,
+                    task_cfg=task_cfg,
+                )
+            ]
+            # 更新观测模态
+            omnigibson_cfg["robots"][0]["obs_modalities"] = ["rgb", "depth", "proprio"]
+            omnigibson_cfg["robots"][0]["proprio_obs"] = list(PROPRIOCEPTION_INDICES["R1Pro"].keys())
+
+            # 设置 task 配置
+            omnigibson_cfg["task"]["include_obs"] = False
+
+            omnigibson_cfg = _omegaconf_sanitize(omnigibson_cfg)
             omnigibson_cfg = OmegaConf.create(omnigibson_cfg)
+
             cfg.env.train.omnigibson_cfg = omnigibson_cfg
-            cfg.env.eval.omnigibson_cfg = omnigibson_cfg
+            cfg.env.eval.omnigibson_cfg = copy.deepcopy(omnigibson_cfg)
 
     return cfg
 

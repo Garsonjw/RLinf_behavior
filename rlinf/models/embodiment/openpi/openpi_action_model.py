@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import math
+import os
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from pathlib import Path
+import cv2
 import jax
 import numpy as np
 import torch
@@ -74,14 +77,37 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
 
     @property
     def _no_split_modules(self) -> list[str]:
-        # Currently, PaliGemmaForConditionalGeneration only support DDP, as many of it's modules are called without forward
+        if self.config.train_expert_only:
+            no_split_modules = [
+                "GemmaDecoderLayer",
+                "SiglipVisionEmbeddings",
+                "GemmaRMSNorm",
+                "GemmaRotaryEmbedding",
+            ]
+        else:
+            no_split_modules = [
+                "GemmaMLP",
+                "SiglipVisionEmbeddings",
+                "GemmaRMSNorm",
+                "GemmaRotaryEmbedding",
+            ]
+        if self.config.noise_method == "flow_noise":
+            no_split_modules.append("ExploreNoiseNet")
+        return no_split_modules
+
+    @property
+    def _no_split_names(self) -> list[str]:
         return [
-            "PaliGemmaForConditionalGeneration",
-            "GemmaDecoderLayer",
-            "SiglipVisionEmbeddings",
-            "GemmaRMSNorm",
-            "GemmaForCausalLM",
-            "GemmaRotaryEmbedding",
+            "action_in_proj",
+            "action_out_proj",
+            "lm_head",
+            # --pi0 only--
+            "state_proj",
+            "action_time_mlp_in",
+            "action_time_mlp_out",
+            # --pi05 only--
+            "time_mlp_in",
+            "time_mlp_out",
         ]
 
     def __init__(
@@ -93,6 +119,7 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         PI0Pytorch.__init__(self, config)
         self.sample_actions = sample_actions_func
         self.global_step = 0
+
         # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
@@ -136,6 +163,12 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             self.noise_head = self.noise_head.to(
                 dtype=self.action_out_proj.weight.dtype
             )
+            
+        for name, module in self.named_modules():
+            # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
+            path_parts = name.split(".")
+            setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
+
 
     def set_global_step(self, global_step):
         self.global_step = global_step
@@ -339,6 +372,7 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         compute_values=True,
         return_obs=True,
     ) -> tuple[np.ndarray, dict[str, Any]]:
+        
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
@@ -346,10 +380,12 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         processed_obs = self.precision_processor(
             processed_obs
         )  # obs precision processor
+        
         observation = _model.Observation.from_dict(processed_obs)
         outputs = self.sample_actions(
             observation, mode=mode, compute_values=compute_values
         )
+        
         actions = self.output_transform(
             {"actions": outputs["actions"], "state": observation.state}
         )["actions"].numpy()
@@ -357,9 +393,13 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         forward_inputs = {
             "chains": outputs["chains"],
             "denoise_inds": outputs["denoise_inds"],
+            "observation/image": env_obs["main_images"],
+            "observation/state": env_obs["states"],
             "tokenized_prompt": processed_obs["tokenized_prompt"],
             "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
         }
+        if env_obs["wrist_images"] is not None:
+            forward_inputs["observation/wrist_image"] = env_obs["wrist_images"]
         forward_inputs.update(to_process_obs)
         forward_inputs.pop("prompt", None)
         result = {
