@@ -1204,6 +1204,17 @@ class EnvOutput:
         )
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
+        # Behavior environment uses different keys (egocentric_camera, wrist_image_left, wrist_image_right)
+        if "egocentric_camera" in obs:
+            return {
+                "egocentric_camera": obs["egocentric_camera"],
+                "wrist_image_left": obs["wrist_image_left"],
+                "wrist_image_right": obs["wrist_image_right"],
+                "states": obs["states"] if "states" in obs else None,
+                "task_descriptions": list(obs["task_descriptions"]) if "task_descriptions" in obs else None,
+            }
+        
+        # Other environments use main_images, wrist_images, etc.
         image_tensor = obs["main_images"] if "main_images" in obs else None
         wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
         extra_view_image_tensor = (

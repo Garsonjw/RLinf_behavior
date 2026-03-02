@@ -22,13 +22,14 @@ from openpi.models import model as _model
 
 
 def make_behavior_example() -> dict:
-    """Creates a random input example for the Behavior policy."""
+    """Creates a random input example for the Behavior policy.
+    Aligned with openpi-comet B1kInputs format.
+    """
     return {
-        "observation/state": np.random.rand(8),
-        "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/wrist_image": np.random.randint(
-            256, size=(224, 224, 3), dtype=np.uint8
-        ),
+        "observation/egocentric_camera": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/wrist_image_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/wrist_image_right": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/state": np.random.rand(23),  # 23-dim state after extract_state_from_proprio
         "prompt": "do something",
     }
 
@@ -67,9 +68,8 @@ def _parse_image(image) -> np.ndarray:
 @dataclasses.dataclass(frozen=True)
 class BehaviorInputs(transforms.DataTransformFn):
     """
-    This class is used to convert inputs to the model to the expected format. It is used for both training and inference.
-    For your own dataset, you can copy this class and modify the keys based on the comments below to pipe
-    the correct elements of your dataset into the model.
+    This class is used to convert inputs to the model to the expected format.
+    Aligned with openpi-comet B1kInputs format for compatibility.
     """
 
     action_dim: int
@@ -82,48 +82,41 @@ class BehaviorInputs(transforms.DataTransformFn):
     depth_as_pcd: bool = False
 
     def __call__(self, data: dict) -> dict:
-        # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
-        # stores as float32 (C,H,W), gets skipped for policy inference.
-        # Keep this for your own dataset, but if your dataset stores the images
-        # in a different key than "observation/image" or "observation/wrist_image",
-        # you should change it below.
-        # Pi0 models support three image inputs at the moment: one third-person view,
-        # and two wrist views (left and right).
-        # If your dataset does not have a particular type
-        # of image, e.g. wrist images, you can comment it out here and
-        # replace it with zeros like we do for the
-        # right wrist image below.
+        # Extract state from proprio data (aligned with openpi-comet B1kInputs)
         proprio_data = data["observation/state"]
-        # extract joint position
         state = extract_state_from_proprio(proprio_data)
-        base_image = _parse_image(data["observation/image"])  # [h, w, c]
-        wrist_image = _parse_image(
-            data["observation/wrist_image"]
-        )  # [num_image, h, w, c]
 
-        # Create inputs dict. Do not change the keys in the dict below.
+        # Parse images - aligned with openpi-comet B1kInputs format
+        # Uses separate keys for each camera instead of stacked wrist images
+        base_image = _parse_image(data["observation/egocentric_camera"])  # [h, w, c]
+        wrist_image_left = _parse_image(data["observation/wrist_image_left"])  # [h, w, c]
+        wrist_image_right = _parse_image(data["observation/wrist_image_right"])  # [h, w, c]
+
+        # Determine image naming based on model type (aligned with openpi-comet)
+        match self.model_type:
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
+                names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+                images = (base_image, wrist_image_left, wrist_image_right)
+                image_masks = (np.True_, np.True_, np.True_)
+            case _model.ModelType.PI0_FAST:
+                names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
+                images = (base_image, wrist_image_left, wrist_image_right)
+                image_masks = (np.True_, np.True_, np.True_)
+            case _:
+                raise ValueError(f"Unsupported model type: {self.model_type}")
+
+        # Create inputs dict
         inputs = {
             "state": state,
-            "image": {
-                "base_0_rgb": base_image,
-                "left_wrist_0_rgb": wrist_image[0, ...],
-                "right_wrist_0_rgb": wrist_image[1, ...],
-            },
-            "image_mask": {
-                "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_
-            },
+            "image": dict(zip(names, images, strict=True)),
+            "image_mask": dict(zip(names, image_masks, strict=True)),
         }
 
-        # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.
         if "actions" in data:
             inputs["actions"] = data["actions"]
 
         # Pass the prompt (aka language instruction) to the model.
-        # Keep this for your own dataset (but modify the key if the instruction is not
-        # stored in "prompt"; the output dict always needs to have the key "prompt").
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 

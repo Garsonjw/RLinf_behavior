@@ -323,7 +323,21 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         }
 
     def obs_processor(self, env_obs):
-        # base observation
+        # Behavior environment - use openpi-comet compatible format
+        if "egocentric_camera" in env_obs:
+            processed_obs = {
+                "observation/egocentric_camera": env_obs["egocentric_camera"],
+                "observation/wrist_image_left": env_obs["wrist_image_left"],
+                "observation/wrist_image_right": env_obs["wrist_image_right"],
+                "prompt": env_obs["task_descriptions"],
+            }
+            state = env_obs["states"]
+            if torch.is_tensor(state):
+                state = state.to(dtype=torch.float32)
+            processed_obs["observation/state"] = state
+            return processed_obs
+        
+        # base observation (original code for other environments)
         processed_obs = {
             "observation/image": env_obs["main_images"],
             "prompt": env_obs["task_descriptions"],
@@ -372,6 +386,8 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         compute_values=True,
         return_obs=True,
     ) -> tuple[np.ndarray, dict[str, Any]]:
+
+        mode = "eval"
         
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
@@ -390,6 +406,28 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             {"actions": outputs["actions"], "state": observation.state}
         )["actions"].numpy()
 
+        # Behavior environment - use openpi-comet compatible format
+        if "egocentric_camera" in env_obs:
+            forward_inputs = {
+                "chains": outputs["chains"],
+                "denoise_inds": outputs["denoise_inds"],
+                "observation/egocentric_camera": env_obs["egocentric_camera"],
+                "observation/wrist_image_left": env_obs["wrist_image_left"],
+                "observation/wrist_image_right": env_obs["wrist_image_right"],
+                "observation/state": env_obs["states"],
+                "tokenized_prompt": processed_obs["tokenized_prompt"],
+                "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
+            }
+            forward_inputs.update(to_process_obs)
+            forward_inputs.pop("prompt", None)
+            result = {
+                "prev_logprobs": outputs["prev_logprobs"],
+                "prev_values": outputs["prev_values"],
+                "forward_inputs": forward_inputs,
+            }
+            return actions, result
+
+        # Original code for other environments
         forward_inputs = {
             "chains": outputs["chains"],
             "denoise_inds": outputs["denoise_inds"],
@@ -447,6 +485,7 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             use_cache=True,
         )
 
+        # noise = torch.zeros_like(noise) 
         x_t = noise
         # add sde sample and traj collect
         chains = []
@@ -579,9 +618,10 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             x_t,
             t_input,
         )
-        v_t = self.action_out_proj(
-            suffix_out.to(dtype=self.action_out_proj.weight.dtype)
-        )  # [bs,n_action_steps,max_action_dim]
+        # 与 openpi-comet 对齐：保持 float32 精度输入 action_out_proj，避免 bfloat16 量化误差累积
+        v_t = self.action_out_proj(suffix_out.to(dtype=self.action_out_proj.weight.dtype))
+        # v_t = self.action_out_proj(suffix_out)  # suffix_out 已经是 float32 (from get_suffix_out)
+        # print(suffix_out.dtype, v_t.dtype)
         # value prediction
         if (
             self.config.add_value_head

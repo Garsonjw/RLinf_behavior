@@ -21,10 +21,10 @@ cluster:
       placement: 0  # All 8 A800 GPUs on node 1
     env:
       node_group: 4090
-      placement: 1  # Both 4090 GPUs on node 0
+      placement: 0  # Both 4090 GPUs on node 0
     rollout:
       node_group: 4090
-      placement: 2  # All 8 A800 GPUs on node 1
+      placement: 1  # All 8 A800 GPUs on node 1
   # total_num_envs ≥ rollout × pipeline_stage_num，且 rollout % env == 0，且 total_num_envs 能被 lcm(actor, rollout × pipeline_stage_num) 整除。
   node_groups:
     - label: 4090
@@ -70,7 +70,7 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 1
-  rollout_epoch: 1
+  rollout_epoch: 10
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: chunk_level
@@ -108,23 +108,6 @@ algorithm:
     max_length: 1024
     min_length: 1
 
-# env:
-#   group_name: "EnvGroup"
-#   enable_offload: False
-
-#   # Override the default values in env/behavior_r1pro
-#   train:
-#     total_num_envs: 4
-#     max_episode_steps: 2000 # max episode steps for truncation
-#     max_steps_per_rollout_epoch: 2000
-#   eval:
-#     total_num_envs: 4
-#     max_episode_steps: 2000 # max episode steps for truncation
-#     max_steps_per_rollout_epoch: 2000
-#     video_cfg:
-#       save_video: True
-#       video_base_dir: ${runner.logger.log_path}/video/eval
-
 env:
   group_name: "EnvGroup"
   enable_offload: False
@@ -132,15 +115,15 @@ env:
   # Override the default values in env/behavior_r1pro
   train:
     total_num_envs: 1
-    max_episode_steps: 2048 # max episode steps for truncation
-    max_steps_per_rollout_epoch: 2048
+    max_episode_steps: 4096 # max episode steps for truncation
+    max_steps_per_rollout_epoch: 4096
     video_cfg:
       save_video: True
       video_base_dir: ${runner.logger.log_path}/video/train
   eval:
     total_num_envs: 1
-    max_episode_steps: 2048 # max episode steps for truncation
-    max_steps_per_rollout_epoch: 2048
+    max_episode_steps: 4096 # max episode steps for truncation
+    max_steps_per_rollout_epoch: 4096
     video_cfg:
       save_video: True
       video_base_dir: ${runner.logger.log_path}/video/eval
@@ -152,7 +135,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/mnt/public/chenjiawei/projects/models/openpi_comet/pi05-b1kpt12-cs32"
+    model_path: "/mnt/public/chenjiawei/projects/models/comet_submission/pi05-turning_on_radio-sft-torch"
     precision: ${actor.model.precision}
 
 actor:
@@ -163,28 +146,19 @@ actor:
   seed: 42
   enable_offload: True
 
-  # Override the default values in model/openvla_oft
-  # model:
-  #   model_path: "/mnt/public/chenjiawei/projects/models/openpi_comet/pi05-b1kpt12-cs32"
-  #   model_type: "openvla_oft"
-  #   value_type: ${algorithm.reward_type}
-  #   action_dim: 23
-  #   unnorm_key: behavior_turn_on_radio
-  #   add_value_head: True
-  #   num_images_in_input: 3
-
+  # Override the default values in model/openpi
   model:
-    model_path: "/mnt/public/chenjiawei/projects/models/openpi_comet/pi05-b1kpt12-cs32"
+    model_path: "/mnt/public/chenjiawei/projects/models/comet_submission/pi05-turning_on_radio-sft-torch"
     add_value_head: True
     num_images_in_input: 3
     num_action_chunks: 32
     action_dim: 23
-    # num_steps: 10 # todo: to align with default openpi eval
+    num_steps: 10 # todo: to align with default openpi eval
     openpi:
       config_name: "pi05_behavior"
       detach_critic_input: True
       joint_logprob: False
-      noise_level: 0.5
+      noise_level: 0.3
       action_env_dim: ${actor.model.action_dim}
       noise_method: "flow_sde"
 

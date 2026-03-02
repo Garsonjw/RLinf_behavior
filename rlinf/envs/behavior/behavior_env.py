@@ -22,7 +22,7 @@ from omnigibson.learning.utils.obs_utils import (
 )
 from omnigibson.macros import gm
 import omnigibson.utils.transform_utils as T
-from openpi.shared.image_tools import resize_with_pad_torch
+from PIL import Image
 
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 from rlinf.utils.logging import get_logger
@@ -30,16 +30,53 @@ from rlinf.utils.logging import get_logger
 from omnigibson.envs import Environment, EnvironmentWrapper
 from omnigibson.learning.utils.eval_utils import HEAD_RESOLUTION, WRIST_RESOLUTION
 from omnigibson.utils.ui_utils import create_module_logger
+from omnigibson.utils.asset_utils import get_task_instance_path
+from omnigibson.utils.python_utils import recursively_convert_to_torch
+import omnigibson as og
+
+# 导入 DISABLED_TRANSITION_RULES，与 openpi-comet eval_custom.py 对齐
+from gello.robots.sim_robot.og_teleop_cfg import DISABLED_TRANSITION_RULES
 
 logger = create_module_logger("RGBWrapper")
-# Make sure object states are enabled
+
+# ============================================================
+# 全局 macros 设置：与 openpi-comet eval_custom.py 完全对齐
+# ============================================================
 gm.HEADLESS = True
-gm.ENABLE_OBJECT_STATES = True
+gm.ENABLE_FLATCACHE = True  # 与 openpi-comet 对齐：启用 flatcache 加速渲染
 gm.USE_GPU_DYNAMICS = False
 gm.ENABLE_TRANSITION_RULES = True
+# 注意：移除 gm.ENABLE_OBJECT_STATES = True，openpi-comet 推理时不设置此项
 
 # Image resize target size (match openpi-comet)
 RESIZE_SIZE = 224
+ROLLOUT_CAMERA_NAMES = ("head", "left_wrist", "right_wrist")
+
+
+# ---------- PIL-based resize_with_pad (与 openpi-comet openpi_client.image_tools 完全一致) ----------
+def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method=Image.BILINEAR) -> Image.Image:
+    cur_width, cur_height = image.size
+    if cur_width == width and cur_height == height:
+        return image
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_image = image.resize((resized_width, resized_height), resample=method)
+    zero_image = Image.new(resized_image.mode, (width, height), 0)
+    pad_height = max(0, int((height - resized_height) / 2))
+    pad_width = max(0, int((width - resized_width) / 2))
+    zero_image.paste(resized_image, (pad_width, pad_height))
+    return zero_image
+
+
+def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
+    """PIL-based resize_with_pad, 与 openpi-comet openpi_client.image_tools.resize_with_pad 一致。"""
+    if images.shape[-3:-1] == (height, width):
+        return images
+    original_shape = images.shape
+    images = images.reshape(-1, *original_shape[-3:])
+    resized = np.stack([np.asarray(_resize_with_pad_pil(Image.fromarray(im), height, width, method=method)) for im in images])
+    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
 
 __all__ = ["BehaviorEnv"]
 
@@ -151,13 +188,36 @@ class BehaviorEnv(gym.Env):
 
         # video
         self._video_writer = None
+        self._rollout_video_writers = None
         self.video_cnt = 0
         if self.cfg.video_cfg.save_video:
             os.makedirs(str(self.cfg.video_cfg.video_base_dir), exist_ok=True)
             self._create_video_writer()
+            self._create_rollout_video_writers()
 
         # cache obs like Evaluator does (policy sees self.obs)
         self.obs = None
+        
+        # ============================================================
+        # 任务实例加载配置（与 openpi-comet eval_custom.py 对齐）
+        # ============================================================
+        self.use_task_instances = getattr(cfg, 'use_task_instances', False)
+        self.random_task_instance = getattr(cfg, 'random_task_instance', True)
+        
+        # 初始化可用的任务实例 ID 列表
+        task_instance_ids = getattr(cfg, 'task_instance_ids', None)
+        if task_instance_ids is not None:
+            self.available_instance_ids = list(task_instance_ids)
+        else:
+            # 默认使用所有训练实例 (0-199)
+            self.available_instance_ids = list(range(200))
+        
+        # 顺序测试时的实例索引计数器
+        self._instance_counter = 0
+        
+        self.logger.info(f"Task instance loading: use_task_instances={self.use_task_instances}, "
+                        f"random_task_instance={self.random_task_instance}, "
+                        f"available_instance_ids={len(self.available_instance_ids)} instances")
 
     def _load_tasks_cfg(self):
         with open_dict(self.cfg):
@@ -172,6 +232,12 @@ class BehaviorEnv(gym.Env):
         self.task_description = task_description_map[self.cfg.omnigibson_cfg["task"]["activity_name"]]
 
     def _init_env(self):
+        # ============================================================
+        # 与 openpi-comet eval_custom.py 对齐：禁用特定的 transition rules
+        # ============================================================
+        for rule in DISABLED_TRANSITION_RULES:
+            rule.ENABLED = False
+        
         # 对齐 Evaluator：任务名要先写进 cfg，然后创建 env
         self._load_tasks_cfg()
         self.env = VectorEnvironment(
@@ -229,6 +295,85 @@ class BehaviorEnv(gym.Env):
             return subenv.scene.object_registry("name", "robot_r1")
         except Exception:
             return None
+
+    def load_task_instance(self, instance_id: int, env_idx: int = 0) -> None:
+        """
+        与 openpi-comet eval_custom.py 的 load_task_instance 对齐。
+        加载特定任务实例的配置（机器人位置、物体状态等）。
+        
+        Args:
+            instance_id (int): 任务实例 ID
+            env_idx (int): 要加载的子环境索引，默认为 0
+        """
+        subenv = self._get_subenv(env_idx)
+        if subenv is None:
+            self.logger.warning(f"Cannot get subenv for env_idx={env_idx}, skipping load_task_instance")
+            return
+        
+        # 获取底层环境（如果是 wrapper 的话需要展开）
+        env = subenv.env if hasattr(subenv, 'env') else subenv
+        
+        robot = self._get_robot_from_subenv(subenv)
+        if robot is None:
+            self.logger.warning(f"Cannot get robot for env_idx={env_idx}, skipping load_task_instance")
+            return
+        
+        try:
+            scene_model = env.task.scene_name
+            tro_filename = env.task.get_cached_activity_scene_filename(
+                scene_model=scene_model,
+                activity_name=env.task.activity_name,
+                activity_definition_id=env.task.activity_definition_id,
+                activity_instance_id=instance_id,
+            )
+            
+            tro_file_path = os.path.join(
+                get_task_instance_path(scene_model),
+                f"json/{scene_model}_task_{env.task.activity_name}_instances/{tro_filename}-tro_state.json",
+            )
+            
+            with open(tro_file_path) as f:
+                tro_state = recursively_convert_to_torch(json.load(f))
+            
+            for tro_key, tro_state_item in tro_state.items():
+                if tro_key == "robot_poses":
+                    presampled_robot_poses = tro_state_item
+                    robot_pos = presampled_robot_poses[robot.model_name][0]["position"]
+                    robot_quat = presampled_robot_poses[robot.model_name][0]["orientation"]
+                    robot.set_position_orientation(robot_pos, robot_quat)
+                    
+                    # Write robot poses to scene metadata
+                    env.scene.write_task_metadata(key=tro_key, data=tro_state_item)
+                else:
+                    env.task.object_scope[tro_key].load_state(tro_state_item, serialized=False)
+            
+            # 确保所有任务相关物体稳定（与 openpi-comet 对齐）
+            for _ in range(25):
+                og.sim.step_physics()
+                for entity in env.task.object_scope.values():
+                    if not entity.is_system and entity.exists:
+                        entity.keep_still()
+            
+            env.scene.update_initial_file()
+            env.scene.reset()
+            
+            self.logger.info(f"Loaded task instance {instance_id} for env_idx={env_idx}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to load task instance {instance_id} for env_idx={env_idx}: {e}")
+
+    def load_task_instances_for_all_envs(self, instance_ids: list[int]) -> None:
+        """
+        为所有子环境加载任务实例。
+        
+        Args:
+            instance_ids (list[int]): 每个子环境对应的任务实例 ID 列表，长度应等于 num_envs
+        """
+        assert len(instance_ids) == self.num_envs, \
+            f"instance_ids length ({len(instance_ids)}) must equal num_envs ({self.num_envs})"
+        
+        for env_idx, instance_id in enumerate(instance_ids):
+            self.load_task_instance(instance_id, env_idx)
 
     def _compute_cam_rel_poses(self, env_idx: int):
         """
@@ -368,15 +513,10 @@ class BehaviorEnv(gym.Env):
         else:
             state_t = state if torch.is_tensor(state) else torch.tensor(state)
 
-        # Images: keep as torch uint8 [H,W,3]
-        def to_u8_t(x):
+        # Images: convert to numpy uint8 [H,W,3] then PIL resize (与 openpi-comet 完全一致)
+        def to_u8_np(x):
             if torch.is_tensor(x):
-                if x.dtype != torch.uint8:
-                    if x.numel() > 0 and float(x.max()) <= 1.0:
-                        x = (x * 255.0).to(torch.uint8)
-                    else:
-                        x = x.to(torch.uint8)
-                return x[..., :3]
+                x = x.detach().cpu().numpy()
             x = np.asarray(x)
             if x.dtype != np.uint8:
                 mx = float(x.max()) if x.size > 0 else 0.0
@@ -384,51 +524,101 @@ class BehaviorEnv(gym.Env):
                     x = (x * 255.0).astype(np.uint8)
                 else:
                     x = np.clip(x, 0, 255).astype(np.uint8)
-            return torch.from_numpy(x[..., :3])
+            return x[..., :3]
 
-        zed_image = to_u8_t(flat[head_key])
-        left_image = to_u8_t(flat[left_key])
-        right_image = to_u8_t(flat[right_key])
+        zed_np = to_u8_np(flat[head_key])
+        left_np = to_u8_np(flat[left_key])
+        right_np = to_u8_np(flat[right_key])
 
-        # Resize images to RESIZE_SIZE x RESIZE_SIZE (match openpi-comet)
-        zed_image = resize_with_pad_torch(zed_image, RESIZE_SIZE, RESIZE_SIZE)
-        left_image = resize_with_pad_torch(left_image, RESIZE_SIZE, RESIZE_SIZE)
-        right_image = resize_with_pad_torch(right_image, RESIZE_SIZE, RESIZE_SIZE)
+        # Resize images to RESIZE_SIZE x RESIZE_SIZE using PIL (与 openpi-comet 完全一致)
+        zed_image = torch.from_numpy(resize_with_pad(zed_np, RESIZE_SIZE, RESIZE_SIZE).copy())
+        left_image = torch.from_numpy(resize_with_pad(left_np, RESIZE_SIZE, RESIZE_SIZE).copy())
+        right_image = torch.from_numpy(resize_with_pad(right_np, RESIZE_SIZE, RESIZE_SIZE).copy())
 
         # Store the last flattened obs for env0 so _write_video can match Evaluator behavior
         if env_idx == 0:
             self.obs = flat
 
+        # Return format aligned with openpi-comet B1kInputs
         return {
-            "main_images": zed_image,  # [RESIZE_SIZE, RESIZE_SIZE, C]
-            "wrist_images": torch.stack([left_image, right_image], dim=0),  # [2, RESIZE_SIZE, RESIZE_SIZE, C]
-            "state": state_t[:32],  # [32]
+            "egocentric_camera": zed_image,  # [RESIZE_SIZE, RESIZE_SIZE, C]
+            "wrist_image_left": left_image,  # [RESIZE_SIZE, RESIZE_SIZE, C]
+            "wrist_image_right": right_image,  # [RESIZE_SIZE, RESIZE_SIZE, C]
+            "state": state_t,  # full proprio state for extract_state_from_proprio
             "flat": flat,
         }
 
 
     def _wrap_obs(self, obs_list):
         """
-        Wrap list of per-env raw obs into batched dict, but extraction semantics aligned to Evaluator.
+        Wrap list of per-env raw obs into batched dict, aligned with openpi-comet B1kInputs format.
         Images are resized to RESIZE_SIZE x RESIZE_SIZE (224x224) to match openpi-comet.
         """
         extracted_obs_list = []
         for env_idx, obs in enumerate(obs_list):
             extracted_obs_list.append(self._extract_obs_image_with_idx(env_idx, obs))
 
+        # Format aligned with openpi-comet B1kInputs expectations
         obs = {
-            "main_images": torch.stack([x["main_images"] for x in extracted_obs_list], dim=0),  # [N_ENV, 224, 224, C]
-            "wrist_images": torch.stack([x["wrist_images"] for x in extracted_obs_list], dim=0),  # [N_ENV, 2, 224, 224, C]
+            "egocentric_camera": torch.stack([x["egocentric_camera"] for x in extracted_obs_list], dim=0),  # [N_ENV, 224, 224, C]
+            "wrist_image_left": torch.stack([x["wrist_image_left"] for x in extracted_obs_list], dim=0),  # [N_ENV, 224, 224, C]
+            "wrist_image_right": torch.stack([x["wrist_image_right"] for x in extracted_obs_list], dim=0),  # [N_ENV, 224, 224, C]
             "task_descriptions": [self.task_description for _ in range(self.num_envs)],
-            "states": torch.stack([x["state"] for x in extracted_obs_list], dim=0),  # [N_ENV, 32]
+            "states": torch.stack([x["state"] for x in extracted_obs_list], dim=0),  # [N_ENV, proprio_dim]
         }
         return obs
 
     # -----------------------------
     # Gym API
     # -----------------------------
-    def reset(self):
+    def reset(self, instance_ids: list[int] | None = None):
+        """
+        重置环境。
+        
+        Args:
+            instance_ids (list[int] | None): 可选，每个子环境要加载的任务实例 ID。
+                如果提供，会在 reset 后加载对应的任务实例配置（与 openpi-comet 评估对齐）。
+                长度应等于 num_envs。
+                如果为 None 且 use_task_instances=True，则根据 random_task_instance 配置自动选择。
+        
+        Returns:
+            obs: 观测
+            infos: 信息字典
+        """
         raw_obs, infos = self.env.reset()
+        
+        # 确定要加载的任务实例 ID
+        if instance_ids is None and self.use_task_instances:
+            # 根据配置自动选择任务实例
+            if self.random_task_instance:
+                # 随机选择任务实例（训练用）
+                instance_ids = [
+                    np.random.choice(self.available_instance_ids) 
+                    for _ in range(self.num_envs)
+                ]
+            else:
+                # 顺序选择（测试/评估用）
+                # 使用计数器按顺序遍历所有实例
+                instance_ids = []
+                for _ in range(self.num_envs):
+                    idx = self._instance_counter % len(self.available_instance_ids)
+                    instance_ids.append(self.available_instance_ids[idx])
+                    self._instance_counter += 1
+                
+                # 检查是否完成一轮完整测试
+                if self._instance_counter >= len(self.available_instance_ids):
+                    self.logger.info(f"Completed testing all {len(self.available_instance_ids)} instances, "
+                                    f"starting next round...")
+                    
+            self.logger.info(f"Auto-selected task instance IDs: {instance_ids} "
+                           f"(counter={self._instance_counter}/{len(self.available_instance_ids)})")
+        
+        # 如果指定了任务实例 ID，加载对应的任务配置
+        if instance_ids is not None:
+            self.load_task_instances_for_all_envs(instance_ids)
+            # 加载任务实例后需要重新获取观测
+            raw_obs = self._get_obs_after_instance_load()
+        
         obs = self._wrap_obs(raw_obs)
 
         # keep metrics behavior same as your old code
@@ -436,6 +626,35 @@ class BehaviorEnv(gym.Env):
         infos = self._record_metrics(rewards, infos)
         self._reset_metrics()
         return obs, infos
+    
+    def _get_obs_after_instance_load(self):
+        """
+        在加载任务实例后获取观测。
+        由于 load_task_instance 会修改场景状态，需要重新获取观测。
+        
+        注意：不能调用 env.reset() 因为会覆盖刚加载的实例状态。
+        使用零动作 step 来获取当前观测。
+        """
+        try:
+            # 方法1：尝试从 VectorEnvironment 获取观测（不重置）
+            if hasattr(self.env, 'get_obs'):
+                result = self.env.get_obs()
+                # 处理返回值可能是 tuple (obs, info) 的情况
+                if isinstance(result, tuple):
+                    return result[0]
+                return result
+        except Exception as e:
+            self.logger.warning(f"get_obs() failed: {e}, trying zero-action step")
+        
+        # 方法2：执行零动作 step 来获取观测（不会显著改变状态）
+        try:
+            action_dim = getattr(self.cfg, 'action_dim', 23)  # 默认 23 维动作
+            zero_action = np.zeros((self.num_envs, action_dim), dtype=np.float32)
+            raw_obs, _, _, _, _ = self.env.step(zero_action)
+            return raw_obs
+        except Exception as e:
+            self.logger.error(f"Failed to get obs after instance load: {e}")
+            raise
 
 
     def step(self, actions=None) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
@@ -444,9 +663,6 @@ class BehaviorEnv(gym.Env):
         - step env with n_render_iterations=1 if supported
         - write video from self.obs (policy-side obs), not raw_obs parsing
         """
-        
-        # try:
-            # try to pass n_render_iterations like Evaluator
         raw_obs, rewards, terminations, truncations, infos = self.env.step(actions)
 
         obs = self._wrap_obs(raw_obs)
@@ -537,6 +753,19 @@ class BehaviorEnv(gym.Env):
             container.close()
         self._video_writer = video_writer
 
+    @property
+    def rollout_video_writers(self) -> dict[str, tuple[Container, Stream]] | None:
+        return self._rollout_video_writers
+
+    @rollout_video_writers.setter
+    def rollout_video_writers(self, rollout_video_writers: dict[str, tuple[Container, Stream]] | None) -> None:
+        if self._rollout_video_writers is not None:
+            for _, (container, stream) in self._rollout_video_writers.items():
+                for packet in stream.encode():
+                    container.mux(packet)
+                container.close()
+        self._rollout_video_writers = rollout_video_writers
+
     def _create_video_writer(self) -> None:
         output_dir = os.path.join(self.cfg.video_cfg.video_base_dir, f"seed_{self.seed_offset}")
         os.makedirs(output_dir, exist_ok=True)
@@ -546,19 +775,36 @@ class BehaviorEnv(gym.Env):
             resolution=(448, 672),
         )
 
+    def _create_rollout_video_writers(self) -> None:
+        output_dir = os.path.join(
+            self.cfg.video_cfg.video_base_dir,
+            f"seed_{self.seed_offset}",
+            f"rollout_{self.video_cnt}",
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        writers: dict[str, tuple[Container, Stream]] = {}
+        for camera_name in ROLLOUT_CAMERA_NAMES:
+            resolution = HEAD_RESOLUTION if camera_name == "head" else WRIST_RESOLUTION
+            writers[camera_name] = create_video_writer(
+                fpath=os.path.join(output_dir, f"{camera_name}.mp4"),
+                resolution=resolution,
+            )
+        self.rollout_video_writers = writers
+
     def flush_video(self, video_sub_dir: str = None) -> None:
         if self.cfg.video_cfg.save_video:
             self.video_writer = None
+            self.rollout_video_writers = None
             self.video_cnt += 1
             self._create_video_writer()
+            self._create_rollout_video_writers()
 
     def _write_video_from_extracted(self, extracted_obs: dict) -> None:
 
-        # env0
-        head = extracted_obs["main_images"][0]          # [H,W,C] uint8 torch
-        wrists = extracted_obs["wrist_images"][0]       # [2,H,W,C] uint8 torch
-        left = wrists[0]
-        right = wrists[1]
+        # env0 - use new key names aligned with openpi-comet
+        head = extracted_obs["egocentric_camera"][0]     # [H,W,C] uint8 torch
+        left = extracted_obs["wrist_image_left"][0]      # [H,W,C] uint8 torch
+        right = extracted_obs["wrist_image_right"][0]    # [H,W,C] uint8 torch
 
         def to_np(x):
             x = x.detach().cpu().numpy()
@@ -567,12 +813,42 @@ class BehaviorEnv(gym.Env):
                 x = (x * 255.0).astype(np.uint8) if mx <= 1.0 else np.clip(x,0,255).astype(np.uint8)
             return np.ascontiguousarray(x)
 
-        left = cv2.resize(to_np(left), (224,224))
-        right = cv2.resize(to_np(right), (224,224))
-        head = cv2.resize(to_np(head), (448,448))
+        left = cv2.resize(to_np(left), (224, 224))
+        right = cv2.resize(to_np(right), (224, 224))
+        head = cv2.resize(to_np(head), (448, 448))
 
         frame = np.expand_dims(np.hstack([np.vstack([left, right]), head]), 0)
         write_video(frame, video_writer=self.video_writer, batch_size=1, mode="rgb")
+        self._write_rollout_from_flat()
+
+    def _write_rollout_from_flat(self) -> None:
+        if self.rollout_video_writers is None or self.obs is None:
+            return
+
+        def to_np_u8(x):
+            if torch.is_tensor(x):
+                x = x.detach().cpu().numpy()
+            else:
+                x = np.asarray(x)
+            if x.dtype != np.uint8:
+                mx = float(x.max()) if x.size > 0 else 0.0
+                if mx <= 1.0:
+                    x = (x * 255.0).astype(np.uint8)
+                else:
+                    x = np.clip(x, 0, 255).astype(np.uint8)
+            return np.ascontiguousarray(x[..., :3])
+
+        for camera_name in ROLLOUT_CAMERA_NAMES:
+            key = ROBOT_CAMERA_NAMES["R1Pro"][camera_name] + "::rgb"
+            if key not in self.obs:
+                continue
+            frame = to_np_u8(self.obs[key])
+            write_video(
+                frame[None, ...],
+                video_writer=self.rollout_video_writers[camera_name],
+                batch_size=1,
+                mode="rgb",
+            )
 
 
     # -----------------------------
@@ -637,3 +913,29 @@ class BehaviorEnv(gym.Env):
 
     def update_reset_state_ids(self):
         pass
+
+    # ============================================================
+    # 任务实例测试辅助方法
+    # ============================================================
+    def reset_instance_counter(self):
+        """重置任务实例计数器，用于重新开始顺序测试"""
+        self._instance_counter = 0
+        self.logger.info("Task instance counter reset to 0")
+    
+    def get_instance_progress(self) -> tuple[int, int]:
+        """
+        获取当前测试进度
+        
+        Returns:
+            (current_count, total_count): 当前已测试数量和总数量
+        """
+        return self._instance_counter, len(self.available_instance_ids)
+    
+    def is_testing_complete(self) -> bool:
+        """检查是否已完成一轮完整的顺序测试"""
+        return self._instance_counter >= len(self.available_instance_ids)
+    
+    def get_remaining_instances(self) -> list[int]:
+        """获取剩余未测试的实例 ID 列表"""
+        start_idx = self._instance_counter % len(self.available_instance_ids)
+        return self.available_instance_ids[start_idx:]

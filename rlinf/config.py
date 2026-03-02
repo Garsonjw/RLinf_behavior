@@ -846,7 +846,7 @@ def validate_embodied_cfg(cfg):
                 )
             ]
             # 更新观测模态
-            omnigibson_cfg["robots"][0]["obs_modalities"] = ["rgb", "depth", "proprio"]
+            omnigibson_cfg["robots"][0]["obs_modalities"] = ["proprio", "rgb"]
             omnigibson_cfg["robots"][0]["proprio_obs"] = list(PROPRIOCEPTION_INDICES["R1Pro"].keys())
 
             # 设置 task 配置
